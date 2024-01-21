@@ -1,0 +1,717 @@
+---
+title: "Predicting Patient No-Show Rates in Healthcare"
+author: "Anastasia Moore"
+output: 
+  html_document:
+    theme: cerulean
+    code_folding: hide
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+```{r, include=FALSE}
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(DataExplorer)
+library(pander)
+library(cowplot)
+
+options(ggplot2.discrete.fill= c("#0a5e2a","#fe0000","#6c4e52","#d5a37b"))
+
+theme_set(theme_bw())
+
+data_orig <- read_csv("Medical_No_Shows_Candidate/Medical_No_Shows.csv")
+
+data <- data_orig %>% 
+  clean_names
+
+fix_type_data <- data %>% 
+  mutate_at(c(3,8:ncol(data)), as.factor)
+
+fixed_data <- fix_type_data %>% 
+  mutate(disability = factor(ifelse(disability == 0, 0, 1)))
+
+#delete rows with the appointment dates mistakes
+fixed_data <- fixed_data %>% 
+  filter(!appointment_id %in% c("5715660", "5679978", "5664962", "5655637","5686628"))
+
+model_data <- fixed_data %>% 
+  mutate(actual_weekday = factor(weekdays(appointment_day)),
+         scheduled_weekday = factor(weekdays(scheduled_day)),
+         scheduled_hour = hour(scheduled_day),
+         days_to_apptmt = as.numeric(as.Date(appointment_day)-as.Date(scheduled_day)),
+         no_show_bool = ifelse(no_show == "Yes", TRUE, FALSE)) %>% 
+  group_by(patient_id) %>%
+  mutate(count_same_patient = n(),
+         same_day_appt = ifelse(appointment_day %in% unique(appointment_day), FALSE,TRUE)) %>% 
+  ungroup() %>% 
+  mutate(patient_type = factor(ifelse(count_same_patient == 1, "New Patient", "Return Patient"))) %>% 
+  group_by(patient_id,appointment_day) %>% 
+  mutate(same_day_appt_count = n(),
+         same_day_appt = ifelse(same_day_appt_count>1,TRUE,FALSE)) %>% 
+  ungroup() %>% 
+  group_by(patient_id) %>% 
+  arrange(appointment_day) %>% 
+  mutate(prior_no_show_bull = case_when(appointment_day == max(appointment_day) ~ FALSE,
+                                        TRUE~no_show_bool),
+         prior_no_shows = sum(prior_no_show_bull)) %>% 
+  ungroup() %>% 
+  mutate(prior_noshow_group = factor(case_when(patient_type == "New Patient" ~ "No History\n(First Visit)",
+                                               prior_no_shows == 0 ~ "None",
+                                               prior_no_shows == 1 ~ "Once",
+                                               prior_no_shows >= 2 ~ "Two times or\nmore"))) %>% 
+  select(-c(prior_no_show_bull,no_show_bool,appointment_id))
+
+
+```
+
+
+The purpose of the following document is to outline my approach and develop a model that predicts the patient’s probability of no-show ("Runnable Code" tab) and, based on my findings, give recommendations to the operating unit ("Executive Summary" tab).
+
+# {.tabset .tabset-fade}
+
+## Executive Summary
+
+Patient no-show is a relatively substantial problem as it results in inefficient resource utilization and poses a risk to the quality of health care services.[^1] 
+
+Historic data from the years 2015 - 2016 was used to find an optimal model that predicts no-show patients. 75% percent of the dataset was randomly assigned to model development, and 25% was assigned to validation. The predictive model was developed using logistic regression. From the training data, the optimal no-show threshold was determined to be 0.8. The final model presented an accuracy of 80.2%.
+
+The most important predictors were prior no-shows and how many days in advance the appointment was scheduled. 
+
+For example, the plot below shows how the count of prior no-shows affects the proportion of the next appointment no-show:
+```{r fig.align = 'center', out.width = '50%'}
+#########################################################################################
+#                                   Visualizations                                      #
+#########################################################################################
+
+#prior no-shows
+plot_no_shows <- model_data %>% 
+  group_by(prior_noshow_group,no_show)%>%
+  count()%>%
+  group_by(prior_noshow_group)%>%
+  mutate(percent = n/sum(n)*100,)%>%
+  ungroup() %>% 
+  arrange(prior_noshow_group)  %>% 
+  arrange(percent)
+
+plot_no_shows <- plot_no_shows[order(-plot_no_shows$percent),] 
+
+# ggplot(plot_no_shows, aes(y = n, x = fct_inorder(prior_noshow_group))) +  
+#   geom_bar(stat='identity', aes(fill = no_show))
+
+ggplot(plot_no_shows, aes(y = percent, x = fct_inorder(prior_noshow_group))) +  
+  geom_bar(stat='identity', aes(fill = no_show))+
+  labs(
+    title = str_wrap("Prior No-show Count", width = 60), 
+    x = element_blank(),
+    y = "Percent" 
+  )+
+  theme(text=element_text(size=15),
+        plot.title = element_text(hjust = 0.5)) 
+```
+
+Generally, the more no-shows there were in the past, the higher the chance of the next no-show. New patients have almost twice as large chances of not showing up for the appointment than the patients who have never missed an appointment before. 
+
+Also, the fewer days in advance an appointment was scheduled, the better chances of showing up:
+```{r fig.align = 'center', out.width = '50%'}
+#days_to_apptmt
+
+plot_no_shows <- model_data %>% 
+  mutate(days_to_apptmt_group = factor(case_when(days_to_apptmt == 0 ~ "Same Day",
+                                                 days_to_apptmt >= 4 ~ "Four Days or More",
+                                                 days_to_apptmt >= 1 ~ "1-3 Days before"))) %>% 
+  group_by(days_to_apptmt_group,no_show)%>%
+  count()%>%
+  group_by(days_to_apptmt_group)%>%
+  mutate(percent = n/sum(n)*100,)%>%
+  ungroup() %>% 
+  arrange(days_to_apptmt_group)  %>% 
+  arrange(percent)
+
+plot_no_shows <- plot_no_shows[order(-plot_no_shows$percent),] 
+
+# ggplot(plot_no_shows, aes(y = n, x = fct_inorder(days_to_apptmt))) +  
+#   geom_bar(stat='identity', aes(fill = no_show))
+
+ggplot(plot_no_shows, aes(y = percent, x = fct_inorder(as.factor(days_to_apptmt_group)))) +  
+  geom_bar(stat='identity', aes(fill = no_show))+
+  labs(
+    title = str_wrap("How many days in-advance the appointment was schedualed?", width = 40), 
+    x = element_blank(),
+    y = "Percent" 
+  )+
+  theme(text=element_text(size=15),
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+Other important predictors included:
+
+* age of patients:
+  
+  On average, patients younger than 50 tend to miss an appointment 6% more often than the older patients.
+
+* hour of the day an appointment was scheduled:
+  
+  Generally, the earlier during the day the appointment was scheduled, the lesser chances of no-show.
+  
+* location ID:
+  
+  Some location IDs showed greater percentages of no-shows than others. More information on the meaning of those IDs is required for better understanding.
+
+* text reminder:
+  
+  Sending a text increases the chances of missing an appointment by 11%.
+
+* Medicaid status: 
+
+  Medicaid patients tend to miss an appointment 4% more often than non-Medicaid patients.
+
+
+This model could help in the overbooking decision. One interesting approach is described in [this article](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4187098/#:~:text=This%20approach%20aims%20to%20overbook,time%2C%20overtime%20and%20total%20cost.).
+Further investigation and deployment are required to improve and validate the model. 
+
+Some unexpected results included the fact that reminder texts showed an increased chance of no-show. It is documented that reminders help decrease no-shows, but the content of the notification may have an affect on how successful it is. The article [Reducing No-Shows and Late Cancellations in Primary Care](https://scholars.unh.edu/cgi/viewcontent.cgi?article=1011&context=scholarly_projects) suggests some ways that this can be done effectively. 
+
+My recommendation would be to focus interventions on patients who have a history of no-shows and patients scheduling in advance, especially if those patients are on Medicaid. The article I mentioned above suggests that helping the patient understand the importance of their visit made them significantly more likely to show up.
+
+## Runnable code {.tabset .tabset-fade}
+
+**Just the code:**
+
+```{r, eval=FALSE}
+#########################################################################################
+#                                                                                       #
+#               The purpose of the code below is to develop model(s) that               #
+#                      predict patient’s probability of no-show.                        #
+#                                                                                       #
+#########################################################################################
+
+#########################################################################################
+#                               Set up the environment                                  #
+#########################################################################################
+
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(DataExplorer)
+library(pander)
+library(cowplot) 
+
+options(ggplot2.discrete.fill= c("#0a5e2a","#fe0000","#6c4e52","#d5a37b"))
+
+theme_set(theme_bw())
+
+#########################################################################################
+#                                   Load the Data                                       #
+#########################################################################################
+
+data_orig <- read_csv("Medical_No_Shows_Candidate/Medical_No_Shows.csv")
+
+#########################################################################################
+#                                   Tidy the Data                                       #
+#########################################################################################
+
+#clean the names of each column
+data <- data_orig %>% 
+  clean_names
+
+#check types of each column
+# str(data)
+
+#fix the types
+fix_type_data <- data %>% 
+  mutate_at(c(3,8:ncol(data)), as.factor)
+
+#check types again to make sure the changes appeared appropriately
+# str(fix_type_data)
+
+#check NA's in each column
+# sapply(fix_type_data, function(x) sum(is.na(x)))
+#great, no NA's
+
+#get the summary of each variable to see any weird values
+# summary(fix_type_data)
+#potential problems:
+#1) age has some weird values of -1 and 115
+#2) disability column has values of 2,3,4 that are not described in the "Data_ref" file
+#3) some scheduled values occured later than the actual appointment?
+
+#fix disability column to only show values of 0 and 1
+fixed_data <- fix_type_data %>% 
+  mutate(disability = factor(ifelse(disability == 0, 0, 1)))
+
+#delete rows with the appointment dates mistakes
+fixed_data <- fixed_data %>% 
+  filter(!appointment_id %in% c("5715660", "5679978", "5664962", "5655637","5686628"))
+
+#double check the changes
+# summary(fixed_data)
+
+#check how many unique values there are for each variable
+# sapply(model_data, function(x) length(unique(x)))
+#appointment_id is the key column (length of unique corresponds to the length of the data)
+
+
+#########################################################################################
+#                                Generate new features                                  #
+#########################################################################################
+
+model_data <- fixed_data %>% 
+  mutate(actual_weekday = factor(weekdays(appointment_day)),
+         scheduled_weekday = factor(weekdays(scheduled_day)),
+         scheduled_hour = hour(scheduled_day),
+         days_to_apptmt = as.numeric(as.Date(appointment_day)-as.Date(scheduled_day)),
+         no_show_bool = ifelse(no_show == "Yes", TRUE, FALSE)) %>% 
+  group_by(patient_id) %>%
+  mutate(count_same_patient = n(),
+         same_day_appt = ifelse(appointment_day %in% unique(appointment_day), FALSE,TRUE)) %>% 
+  ungroup() %>% 
+  mutate(patient_type = factor(ifelse(count_same_patient == 1, "New Patient", "Return Patient"))) %>% 
+  group_by(patient_id,appointment_day) %>% 
+  mutate(same_day_appt_count = n(),
+         same_day_appt = ifelse(same_day_appt_count>1,TRUE,FALSE)) %>% 
+  ungroup() %>% 
+  group_by(patient_id) %>% 
+  arrange(appointment_day) %>% 
+  mutate(prior_no_show_bull = case_when(appointment_day == max(appointment_day) ~ FALSE,
+                                        TRUE~no_show_bool),
+         prior_no_shows = sum(prior_no_show_bull)) %>% 
+  ungroup() %>% 
+  mutate(prior_noshow_group = factor(case_when(patient_type == "New Patient" ~ "No History\n(First Visit)",
+                                               prior_no_shows == 0 ~ "None",
+                                               prior_no_shows == 1 ~ "Once",
+                                               prior_no_shows >= 2 ~ "Two times or\nmore"))) %>% 
+  select(-c(prior_no_show_bull,no_show_bool,appointment_id))
+
+#summary(model_data)
+
+
+#########################################################################################
+#                                 Create the model                                      #
+#########################################################################################
+
+#split the data into the training and testing sets (75% - train, 25% - test)
+sample_size <- floor(0.75 * nrow(model_data))
+
+# ensure the results are repeatable
+set.seed(123)
+train_ind <- sample(seq_len(nrow(model_data)), size = sample_size)
+
+train <- model_data[train_ind, ]
+test <- model_data[-train_ind, ]
+
+#create the model
+model <- glm(no_show ~sms_received+prior_no_shows+age
+             +days_to_apptmt+scheduled_hour+location_id+medicaid_ind,
+             family = binomial, data = train)
+summary(model) %>% pander()
+
+#########################################################################################
+#                                   Test the model                                      #
+#########################################################################################
+
+test_response <- predict(model, test, type = "response")
+
+test$test_response <-test_response
+
+evaluate <- test %>% 
+  mutate(classification = ifelse(test_response > .8, "Predicted Yes", "Predicted No"))
+
+
+(result <- table(evaluate$no_show, evaluate$classification)) 
+
+#percent correctly classified:
+pcc<- (result[1,1] + result[2,2]) / (result[1,1] + result[1,2] + result[2,1]+result[2,2])
+
+paste0(round(pcc*100,2),"%") 
+```
+
+**Explanation of the code:**
+
+### Load the Data
+
+```{r}
+#########################################################################################
+#                               Set up the environment                                  #
+#########################################################################################
+
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(DataExplorer)
+library(pander)
+library(cowplot) 
+
+options(ggplot2.discrete.fill= c("#0a5e2a","#fe0000","#6c4e52","#d5a37b"))
+
+theme_set(theme_bw())
+
+```
+
+I am starting by loading the data:
+
+```{r}
+#########################################################################################
+#                                   Load the Data                                       #
+#########################################################################################
+
+data_orig <- read_csv("Medical_No_Shows_Candidate/Medical_No_Shows.csv")
+
+```
+
+Then I am tidying it (fixing data types of each column, checking for missing values, checking for any strange values in the data):
+
+```{r}
+#########################################################################################
+#                                   Tidy the Data                                       #
+#########################################################################################
+
+#clean the names of each column
+data <- data_orig %>% 
+  clean_names
+
+#check types of each column
+# str(data)
+
+#fix the types
+fix_type_data <- data %>% 
+  mutate_at(c(3,8:ncol(data)), as.factor)
+
+#check types again to make sure the changes appeared appropriately
+# str(fix_type_data)
+
+#check NA's in each column
+# sapply(fix_type_data, function(x) sum(is.na(x)))
+#great, no NA's
+
+#get the summary of each variable to see any weird values
+#summary(fix_type_data)
+#potential problems:
+#1) age has some weird values of -1 and 115
+#2) disability column has values of 2,3,4 that are not described in the "Data_ref" file
+#3) some scheduled values occured later than the actual appointment?
+
+```
+Potential problems with the data that were detected:
+
+1) age has some weird values of -1 and 115;
+
+   I have decided to keep those values because -1 might represent babies under 1 year old and because the oldest person on earth seems to be 116. This would be something I would clarify.
+
+2) disability column has values of 2,3,4 that are not described in the "Data_ref" file;
+
+   I have decided to fix that column with 0 representing no disability and anything other than that as having a disability. 
+   
+3) Some values of the scheduled_day column (the date the appointment was scheduled) occurred later than the actual appointment date. 
+
+   I have decided to remove the rows that had those mistakes because I ended up using a feature produced from those columns in my final model.
+
+```{r}
+
+#fix disability column to only show values of 0 and 1
+fixed_data <- fix_type_data %>% 
+  mutate(disability = factor(ifelse(disability == 0, 0, 1)))
+
+#delete rows with the appointment dates mistakes
+fixed_data <- fixed_data %>% 
+  filter(!appointment_id %in% c("5715660", "5679978", "5664962", "5655637","5686628"))
+
+#double check the changes
+# summary(fixed_data)
+
+#check how many unique values there are for each variable
+# sapply(model_data, function(x) length(unique(x)))
+#appointment_id is the key column (length of unique corresponds to the length of the data)
+
+```
+
+I then generated new features that could potentially help predict no-shows:
+
+```{r}
+#########################################################################################
+#                                Generate new features                                  #
+#########################################################################################
+
+model_data <- fixed_data %>% 
+  mutate(actual_weekday = factor(weekdays(appointment_day)),
+         scheduled_weekday = factor(weekdays(scheduled_day)),
+         scheduled_hour = hour(scheduled_day),
+         days_to_apptmt = as.numeric(as.Date(appointment_day)-as.Date(scheduled_day)),
+         no_show_bool = ifelse(no_show == "Yes", TRUE, FALSE)) %>% 
+  group_by(patient_id) %>%
+  mutate(count_same_patient = n(),
+         same_day_appt = ifelse(appointment_day %in% unique(appointment_day), FALSE,TRUE)) %>% 
+  ungroup() %>% 
+  mutate(patient_type = factor(ifelse(count_same_patient == 1, "New Patient", "Return Patient"))) %>% 
+  group_by(patient_id,appointment_day) %>% 
+  mutate(same_day_appt_count = n(),
+         same_day_appt = ifelse(same_day_appt_count>1,TRUE,FALSE)) %>% 
+  ungroup() %>% 
+  group_by(patient_id) %>% 
+  arrange(appointment_day) %>% 
+  mutate(prior_no_show_bull = case_when(appointment_day == max(appointment_day) ~ FALSE,
+                                        TRUE~no_show_bool),
+         prior_no_shows = sum(prior_no_show_bull)) %>% 
+  ungroup() %>% 
+  mutate(prior_noshow_group = factor(case_when(patient_type == "New Patient" ~ "No History\n(First Visit)",
+                                               prior_no_shows == 0 ~ "None",
+                                               prior_no_shows == 1 ~ "Once",
+                                               prior_no_shows >= 2 ~ "Two times or\nmore"))) %>% 
+  select(-c(prior_no_show_bull,no_show_bool,appointment_id))
+
+```
+
+
+### Exploratory data analysis
+
+Visual Representation of the initial data:
+
+```{r, echo= FALSE,fig.align = 'center', out.width = '75%'}
+#########################################################################################
+#                                         EDA                                           #
+#########################################################################################
+#plot_str(model_data)
+
+filename <- "presentation_pictures/data_diagram1.PNG"
+if (file.exists(filename)) {
+knitr::include_graphics(filename)
+}
+```
+
+Univariate and multivariate analyses of the data were performed using `DataExplorer` package:
+```{r}
+
+# config <- configure_report(
+#   add_plot_str = TRUE,
+#   add_plot_qq = FALSE,
+#   add_plot_prcomp = TRUE,
+#   add_plot_boxplot = TRUE,
+#   add_plot_scatterplot = FALSE,
+#   global_ggtheme = quote(theme_minimal(base_size = 14))
+# )
+# create_report(model_data,y="no_show", config = config)
+
+```
+
+Interesting plots:
+```{r}
+plot_bar(model_data, by = "no_show")
+
+```
+
+```{r}
+#count_same_patient
+# model_data %>% 
+#   group_by(count_same_patient,no_show)%>%
+#   count()%>%
+#   group_by(count_same_patient)%>%
+#   mutate(percent = n/sum(n)*100,)%>%
+#   ungroup() %>% 
+#   ggplot()+
+#   geom_col(aes(x=count_same_patient,y=n, fill=no_show))
+
+p2 <- model_data %>% 
+  group_by(count_same_patient,no_show)%>%
+  count()%>%
+  group_by(count_same_patient)%>%
+  mutate(percent = n/sum(n)*100,)%>%
+  ungroup() %>% 
+  ggplot()+
+  geom_col(aes(x=count_same_patient,y=percent, fill=no_show))
+
+#age
+p3 <- model_data %>% 
+  filter(age<100) %>% 
+  group_by(age,no_show)%>%
+  count()%>%
+  group_by(age)%>%
+  mutate(percent = n/sum(n)*100,)%>%
+  ungroup() %>% 
+  ggplot()+
+  geom_col(aes(x=age,y=percent, fill=no_show))
+
+
+#location_id
+p4 <- model_data %>% 
+  group_by(location_id,no_show)%>%
+  count()%>%
+  group_by(location_id)%>%
+  mutate(percent = n/sum(n)*100)%>% 
+  ggplot()+
+  geom_col(aes(x=location_id,y=percent,fill=no_show))
+
+#schedule_hour
+p5 <- model_data %>% 
+  group_by(scheduled_hour,no_show)%>%
+   count()%>%
+   group_by(scheduled_hour)%>%
+   mutate(percent = n/sum(n)*100)%>% 
+   ggplot()+
+   geom_col(aes(x=scheduled_hour,y=percent,fill=no_show))
+
+
+#age
+# model_data %>% 
+#   filter(age<100) %>% 
+#   group_by(age,no_show)%>%
+#   count()%>%
+#   group_by(age)%>%
+#   mutate(percent = n/sum(n)*100,)%>%
+#   ungroup() %>% 
+#   ggplot()+
+#   geom_col(aes(x=age,y=n, fill=no_show))
+
+
+p6 <- model_data %>% 
+  filter(age<100) %>% 
+  group_by(age,no_show)%>%
+  count()%>%
+  group_by(age)%>%
+  mutate(percent = n/sum(n)*100,)%>%
+  ungroup() %>% 
+  ggplot()+
+  geom_col(aes(x=age,y=percent, fill=no_show))
+
+# model_data %>%
+#   mutate(age_category = ifelse(age<50, "less than 50", "older than 50")) %>% group_by(age_category,no_show)%>%
+#   count()%>%
+# group_by(age_category)%>%
+# mutate(percent = n/sum(n)*100,)
+
+all_plots <- plot_grid(p2,p3,p4,p5,p6)
+
+
+ggdraw(all_plots, ylim = c(-0.2, 1.1), xlim = c(0, 1), clip = "on")
+
+```
+
+Find most important features:
+
+```{r}
+#split the data into the training and testing sets (75% - train, 25% - test)
+sample_size <- floor(0.75 * nrow(model_data))
+
+# ensure the results are repeatable
+set.seed(123)
+train_ind <- sample(seq_len(nrow(model_data)), size = sample_size)
+
+train <- model_data[train_ind, ]
+test <- model_data[-train_ind, ]
+
+#Rank Features By Importance
+
+# ensure results are repeatable
+set.seed(7)
+# load the library
+library(caret)
+# prepare training scheme
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+train_data <- train %>% 
+  select(-c(patient_id))
+
+model <- glm(no_show ~ .,family = binomial, data = train_data)
+# estimate variable importance
+importance <- varImp(model, scale=FALSE)
+# summarize importance
+#print(importance %>% arrange(-Overall))
+
+# plot importance
+importance <- data.frame(importance) %>%
+  mutate(feature = row.names(importance)) %>% 
+  arrange(Overall)
+
+row.names(importance) <- NULL
+
+
+ggplot(data = importance, mapping = aes(y = fct_inorder(feature),  
+                                 x = Overall)) +  
+  geom_bar(stat='identity',fill = "#3388dd") +
+  theme_classic()+
+  labs(title = str_wrap("What are most important features in predicting no-show?", width = 70),
+    x = "Variable Importance Score", 
+    y = "Feature" 
+    
+  ) 
+
+```
+
+
+Visual Representation of the data that went into the model:
+
+```{r, echo= FALSE,fig.align = 'center', out.width = '75%'}
+#########################################################################################
+#                                         EDA                                           #
+#########################################################################################
+#plot_str(model_data)
+
+filename <- "presentation_pictures/data_diagram2.PNG"
+if (file.exists(filename)) {
+knitr::include_graphics(filename)
+}
+```
+
+
+
+### Create the model
+
+Here I am creating the final model using Logistic Regression:
+```{r}
+#########################################################################################
+#                                 Create the model                                      #
+#########################################################################################
+
+#split the data into the training and testing sets (75% - train, 25% - test)
+sample_size <- floor(0.75 * nrow(model_data))
+
+# ensure the results are repeatable
+set.seed(123)
+train_ind <- sample(seq_len(nrow(model_data)), size = sample_size)
+
+train <- model_data[train_ind, ]
+test <- model_data[-train_ind, ]
+
+#create the model
+model <- glm(no_show ~sms_received+prior_no_shows+age
+             +days_to_apptmt+scheduled_hour+location_id+medicaid_ind,
+             family = binomial, data = train)
+summary(model) %>% pander()
+```
+
+All the variables are way below zero, so the model is significant.
+
+Let's test our model by looking at the confusion matrix:
+
+```{r}
+#########################################################################################
+#                                   Test the model                                      #
+#########################################################################################
+
+test_response <- predict(model, test, type = "response")
+
+test$test_response <-test_response
+
+evaluate <- test %>% 
+  mutate(classification = ifelse(test_response > .8, "Predicted Yes", "Predicted No"))
+
+
+(result <- table(evaluate$no_show, evaluate$classification)) %>% pander()
+```
+
+And the percent correctly classified:
+```{r}
+#percent correctly classified:
+pcc<- (result[1,1] + result[2,2]) / (result[1,1] + result[1,2] + result[2,1]+result[2,2])
+
+paste0(round(pcc*100,2),"%") %>% pander()
+
+```
+
+
+
+[^1]: [Development and validation of a patient no-show predictive model at a primary care setting in Southern Brazil](https://pubmed.ncbi.nlm.nih.gov/30947294/)
+
